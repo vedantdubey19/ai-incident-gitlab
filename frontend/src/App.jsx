@@ -2,6 +2,7 @@ import { Routes, Route, Link } from "react-router-dom";
 import Dashboard from "./pages/Dashboard.jsx";
 import Projects from "./pages/Projects.jsx";
 import IncidentDetails from "./pages/IncidentDetails.jsx";
+import Incidents from "./pages/Incidents.jsx";
 
 export default function App() {
   return (
@@ -11,6 +12,7 @@ export default function App() {
         <nav className="flex flex-col gap-2">
           <Link to="/">Dashboard</Link>
           <Link to="/projects">Projects</Link>
+          <Link to="/incidents">Incidents</Link>
         </nav>
       </aside>
 
@@ -18,6 +20,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/projects" element={<Projects />} />
+          <Route path="/incidents" element={<Incidents />} />
           <Route path="/incidents/:id" element={<IncidentDetails />} />
         </Routes>
       </main>

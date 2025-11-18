@@ -1,101 +1,128 @@
 import axios from "axios";
+import { Buffer } from "buffer";
 
 const GITLAB_BASE_URL = process.env.GITLAB_BASE_URL || "https://gitlab.com/api/v4";
 
-/**
- * Get GitLab API client for a specific project token
- */
-function gitlabClient(token) {
+export function createGitlabClient(project) {
   return axios.create({
     baseURL: GITLAB_BASE_URL,
     headers: {
-      "Private-Token": token
+      "Private-Token": project.gitlabAccessToken,
+      "Content-Type": "application/json"
     }
   });
 }
 
-/**
- * Extract "namespace/project" from a GitLab URL
- * e.g. https://gitlab.com/org/sample-service -> org/sample-service
- */
-export function extractProjectPath(gitlabProjectUrl) {
-  try {
-    const url = new URL(gitlabProjectUrl);
-    // remove leading slash
-    return url.pathname.replace(/^\/+/, "");
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * Fetch project info using the URL + token
- */
-export async function fetchGitlabProjectInfo(gitlabProjectUrl, token) {
-  const path = extractProjectPath(gitlabProjectUrl);
-  if (!path) {
-    throw new Error("Invalid GitLab project URL");
-  }
-
-  const client = gitlabClient(token);
-  const encoded = encodeURIComponent(path);
-
-  const res = await client.get(`/projects/${encoded}`);
-  return res.data; // contains id, name, namespace, web_url, etc.
-}
-
-/**
- * Fetch pipeline details
- */
-export async function fetchPipeline(project, pipelineId) {
-  const client = gitlabClient(project.gitlabAccessToken);
-  const res = await client.get(`/projects/${project.gitlabProjectId}/pipelines/${pipelineId}`);
-  return res.data;
-}
-
-/**
- * Fetch jobs for a pipeline (optionally filter failed)
- */
-export async function fetchPipelineJobs(project, pipelineId) {
-  const client = gitlabClient(project.gitlabAccessToken);
-  const res = await client.get(
-    `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/jobs`,
-    {
-      params: {
-        per_page: 100
-      }
-    }
-  );
-  return res.data; //array
-}
-
-export async function fetchJobLog(project, jobId) {
-  const client = gitlabClient(project.gitlabAccessToken);
-  const res = await client.get(
-    `/projects/${project.gitlabProjectId}/jobs/${jobId}/trace`,
-    {
-      responseType: "text"
-    }
-  );
-  return res.data;
-}
-
-export async function fetchGitlabCiConfig(project, ref) {
-  const client = gitlabClient(project.gitlabAccessToken);
+export async function createBranch(project, branch, base = "main") {
+  const api = createGitlabClient(project);
 
   try {
-    const res = await client.get(
-      `/projects/${project.gitlabProjectId}/repository/files/${encodeURIComponent(
-        ".gitlab-ci.yml"
-      )}/raw`,
-      {
-        params: { ref }
-      }
+    const res = await api.post(
+      `/projects/${project.gitlabProjectId}/repository/branches`,
+      { branch, ref: base }
     );
     return res.data;
   } catch (err) {
-    // .gitlab-ci.yml might not exist for some repos
-    console.warn("Could not fetch .gitlab-ci.yml:", err.message);
+    if (err.response?.data?.message === "Branch already exists") {
+      return { exists: true };
+    }
+    throw err;
+  }
+}
+
+export async function getFile(project, path, ref = "main") {
+  const api = createGitlabClient(project);
+
+  const res = await api.get(
+    `/projects/${project.gitlabProjectId}/repository/files/${encodeURIComponent(path)}`,
+    { params: { ref } }
+  );
+
+  return Buffer.from(res.data.content, "base64").toString("utf8");
+}
+
+export async function commitFile(project, branch, filePath, content, message, isNew) {
+  const api = createGitlabClient(project);
+
+  const res = await api.post(
+    `/projects/${project.gitlabProjectId}/repository/commits`,
+    {
+      branch,
+      commit_message: message,
+      actions: [
+        {
+          action: isNew ? "create" : "update",
+          file_path: filePath,
+          content
+        }
+      ]
+    }
+  );
+
+  return res.data;
+}
+
+export async function createMR(project, branch, title, description) {
+  const api = createGitlabClient(project);
+
+  const res = await api.post(
+    `/projects/${project.gitlabProjectId}/merge_requests`,
+    {
+      source_branch: branch,
+      target_branch: "main",
+      title,
+      description,
+      squash: true,
+      remove_source_branch: true
+    }
+  );
+
+  return res.data;
+}
+
+export async function fetchPipeline(project, pipelineId) {
+  const api = createGitlabClient(project);
+  const res = await api.get(
+    `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}`
+  );
+  return res.data;
+}
+
+export async function fetchPipelineJobs(project, pipelineId) {
+  const api = createGitlabClient(project);
+  const res = await api.get(
+    `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/jobs`
+  );
+  return res.data || [];
+}
+
+export async function fetchJobLog(project, jobId) {
+  const api = createGitlabClient(project);
+  const res = await api.get(
+    `/projects/${project.gitlabProjectId}/jobs/${jobId}/trace`
+  );
+  return res.data;
+}
+
+export async function fetchGitlabCiConfig(project, ref = "main") {
+  try {
+    return await getFile(project, ".gitlab-ci.yml", ref);
+  } catch (err) {
+    console.warn("CI config not found:", err.message);
     return null;
   }
+}
+
+export async function fetchGitlabProjectInfo(gitlabProjectUrl, gitlabAccessToken) {
+  const api = axios.create({
+    baseURL: GITLAB_BASE_URL,
+    headers: {
+      "Private-Token": gitlabAccessToken,
+      "Content-Type": "application/json"
+    }
+  });
+
+  const path = new URL(gitlabProjectUrl).pathname.replace(/^\/+/, "");
+  const res = await api.get(`/projects/${encodeURIComponent(path)}`);
+  return res.data;
 }

@@ -41,8 +41,10 @@ const incidentSchema = new mongoose.Schema(
       ref: "AIPatch"
     },
     mergeRequest: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "MergeRequest"
+      id: { type: Number },
+      url: { type: String },
+      branch: { type: String },
+      status: { type: String }
     }
   },
   { timestamps: true }

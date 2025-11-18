@@ -1,0 +1,9 @@
+# Local environment secrets
+ai-service/.env
+backend/.env
+
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+ai-service/node_modules/

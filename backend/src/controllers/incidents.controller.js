@@ -1,7 +1,19 @@
 import { Incident } from "../models/Incident.js";
 import { AIAnalysis } from "../models/AIAnalysis.js";
 import { AIPatch } from "../models/AIPatch.js";
-import { MergeRequest } from "../models/MergeRequest.js";
+import { callRCA, callGeneratePatch } from "../services/ai.service.js";
+import { Project } from "../models/Project.js";
+import {
+  createBranch,
+  getFile,
+  commitFile,
+  createMR as createGitlabMR
+} from "../services/gitlab.service.js";
+import { cleanDiff, extractFilePath, isNewFile } from "../utils/diffParser.js";
+import {
+  applyPatchNewFile,
+  applyPatchExistingFile
+} from "../utils/patchEngine.js";
 
 export async function listIncidents(req, res, next) {
   try {
@@ -36,8 +48,7 @@ export async function getIncident(req, res, next) {
     const incident = await Incident.findById(req.params.id)
       .populate("project", "name gitlabUrl")
       .populate("aiAnalysis")
-      .populate("aiPatch")
-      .populate("mergeRequest");
+      .populate("aiPatch");
 
     if (!incident) {
       return res.status(404).json({
@@ -89,7 +100,11 @@ export async function updateIncident(req, res, next) {
 
 export async function triggerAnalysis(req, res, next) {
   try {
-    const incident = await Incident.findById(req.params.id);
+    const incident = await Incident.findById(req.params.id).populate(
+      "project",
+      "name gitlabProjectId gitlabUrl"
+    );
+
     if (!incident) {
       return res.status(404).json({
         success: false,
@@ -98,15 +113,30 @@ export async function triggerAnalysis(req, res, next) {
       });
     }
 
+    const rca = await callRCA({
+      incidentId: incident._id.toString(),
+      logs: incident.fullLogs || "",
+      gitlabCiConfig: incident.gitlabCiConfig || "",
+      metadata: {
+        projectName: incident.project?.name,
+        pipelineId: incident.pipelineId,
+        jobName: incident.jobName,
+        gitRef: incident.gitRef
+      }
+    });
+
     const analysis = await AIAnalysis.create({
       incident: incident._id,
-      summary: "Mock summary from AI",
-      rootCause: "Mock root cause",
-      category: "other",
-      confidence: 0.5
+      summary: rca.summary,
+      rootCause: rca.rootCause,
+      category: rca.category,
+      confidence: rca.confidence
     });
 
     incident.aiAnalysis = analysis._id;
+    if (!incident.category && rca.category) {
+      incident.category = rca.category;
+    }
     await incident.save();
 
     res.json({
@@ -121,7 +151,11 @@ export async function triggerAnalysis(req, res, next) {
 
 export async function triggerPatch(req, res, next) {
   try {
-    const incident = await Incident.findById(req.params.id);
+    const incident = await Incident.findById(req.params.id).populate(
+      "project",
+      "name gitlabProjectId gitlabUrl"
+    );
+
     if (!incident) {
       return res.status(404).json({
         success: false,
@@ -130,11 +164,27 @@ export async function triggerPatch(req, res, next) {
       });
     }
 
+    // TODO: later fetch related repo files via GitLab; for now, empty
+    const files = [];
+
+    const patchRes = await callGeneratePatch({
+      incidentId: incident._id.toString(),
+      logs: incident.fullLogs || "",
+      gitlabCiConfig: incident.gitlabCiConfig || "",
+      files,
+      metadata: {
+        projectName: incident.project?.name,
+        pipelineId: incident.pipelineId,
+        jobName: incident.jobName,
+        gitRef: incident.gitRef
+      }
+    });
+
     const patch = await AIPatch.create({
       incident: incident._id,
-      diff: "diff --git a/file.js b/file.js\n--- a/file.js\n+++ b/file.js\n@@ -1,1 +1,1 @@\n-console.log('old')\n+console.log('new')",
-      description: "Mock AI patch",
-      riskLevel: "low"
+      diff: patchRes.diff,
+      description: patchRes.description,
+      riskLevel: patchRes.riskLevel || "medium"
     });
 
     incident.aiPatch = patch._id;
@@ -150,36 +200,102 @@ export async function triggerPatch(req, res, next) {
   }
 }
 
-export async function createMR(req, res, next) {
+export async function createMergeRequest(req, res, next) {
   try {
-    const incident = await Incident.findById(req.params.id);
+    const incidentId = req.params.incidentId || req.params.id;
+
+    const incident = await Incident.findById(incidentId).populate("aiPatch");
     if (!incident) {
-      return res.status(404).json({
-        success: false,
-        data: null,
-        error: { code: "INCIDENT_NOT_FOUND", message: "Incident not found" }
-      });
+      return res.status(404).json({ error: "Incident not found" });
     }
 
-    const mr = await MergeRequest.create({
-      incident: incident._id,
-      mrId: 1,
-      mrIid: 1,
-      url: "https://gitlab.com/mock/project/-/merge_requests/1",
-      branchName: "ai-fix/mock",
-      status: "opened",
-      lastCheckedAt: new Date()
-    });
+    const project = await Project.findById(incident.project);
+    if (!project) {
+      return res.status(404).json({ error: "Project not found" });
+    }
 
-    incident.mergeRequest = mr._id;
+    if (!incident.aiPatch?.diff) {
+      return res.status(400).json({ error: "AI patch missing. Generate patch first." });
+    }
+
+    const diff = cleanDiff(incident.aiPatch.diff);
+
+    if (!diff || diff.length < 10) {
+      return res.status(400).json({ error: "Empty or invalid AI diff" });
+    }
+
+    const filePath = extractFilePath(diff);
+    if (!filePath) {
+      return res.status(400).json({ error: "Could not detect file path from diff" });
+    }
+
+    const branch = `incident-fix-${incident._id}`;
+    const newFile = isNewFile(diff);
+
+    try {
+      await createBranch(project, branch);
+    } catch (err) {
+      if (err.response?.data?.message === "Branch already exists") {
+        console.log("⚠️ Branch already exists → reusing:", branch);
+      } else {
+        throw err;
+      }
+    }
+
+    let updatedContent;
+
+    if (newFile) {
+      updatedContent = applyPatchNewFile(diff);
+
+      if (!updatedContent?.trim()) {
+        return res.status(400).json({ error: "AI patch contained no valid content." });
+      }
+
+      await commitFile(
+        project,
+        branch,
+        filePath,
+        updatedContent,
+        `AI created ${filePath}`,
+        true
+      );
+    } else {
+      const original = await getFile(project, filePath);
+      updatedContent = applyPatchExistingFile(original, diff);
+
+      if (!updatedContent) {
+        return res.status(400).json({ error: "Could not patch file" });
+      }
+
+      await commitFile(
+        project,
+        branch,
+        filePath,
+        updatedContent,
+        `AI patched ${filePath}`,
+        false
+      );
+    }
+
+    const mr = await createGitlabMR(
+      project,
+      branch,
+      `AI Fix for Incident ${incident._id}`,
+      "Automatically generated fix."
+    );
+
+    incident.mergeRequest = {
+      id: mr.iid,
+      url: mr.web_url,
+      branch,
+      status: mr.state
+    };
+
     await incident.save();
 
-    res.json({
-      success: true,
-      data: { mergeRequest: mr },
-      error: null
-    });
+    return res.json({ success: true, data: { mr }, error: null });
   } catch (err) {
+    console.error("MR error:", err.response?.data || err.message);
     next(err);
   }
 }
